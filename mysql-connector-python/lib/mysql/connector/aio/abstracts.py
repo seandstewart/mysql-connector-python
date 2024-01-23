@@ -88,7 +88,7 @@ from ..errors import (
     InterfaceError,
     InternalError,
     NotSupportedError,
-    ProgrammingError,
+    ProgrammingError, OperationalError,
 )
 from ..types import (
     BinaryProtocolType,
@@ -206,6 +206,7 @@ class MySQLConnectionAbstract(ABC):
         self._host: str = host
         self._port: int = port
         self._database: str = database
+        self._charset_id: int = 45
         self._password1: str = password1
         self._password2: str = password2
         self._password3: str = password3
@@ -234,6 +235,7 @@ class MySQLConnectionAbstract(ABC):
         self._tls_ciphersuites: Optional[List[str]] = []
         self._auth_plugin: Optional[str] = auth_plugin
         self._auth_plugin_class: Optional[str] = None
+        self._pool_config_version: Optional[Any] = None
         self._handshake: Optional[HandShakeType] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = (
             loop or asyncio.get_event_loop()
@@ -689,6 +691,16 @@ class MySQLConnectionAbstract(ABC):
         self._consume_results = value
 
     @property
+    def pool_config_version(self) -> Any:
+        """Returns the pool configuration version."""
+        return self._pool_config_version
+
+    @pool_config_version.setter
+    def pool_config_version(self, value: Any) -> None:
+        """Sets the pool configuration version"""
+        self._pool_config_version = value
+
+    @property
     def in_transaction(self) -> bool:
         """MySQL session has started a transaction."""
         return self._in_transaction
@@ -1005,12 +1017,6 @@ class MySQLConnectionAbstract(ABC):
         await self.cmd_query(
             f"SET NAMES '{self._charset.name}' COLLATE '{self._charset.collation}'"
         )
-        try:
-            # Required for C Extension
-            self.set_character_set_name(self._charset.name)
-        except AttributeError:
-            # Not required for pure Python connection
-            pass
 
         if self.converter:
             self.converter.set_charset(self._charset.name)
@@ -1330,6 +1336,139 @@ class MySQLConnectionAbstract(ABC):
     async def rollback(self) -> None:
         """Rollback current transaction."""
 
+    async def start_transaction(
+        self,
+        consistent_snapshot: bool = False,
+        isolation_level: Optional[str] = None,
+        readonly: Optional[bool] = None,
+    ) -> None:
+        """Starts a transaction.
+
+        This method explicitly starts a transaction sending the
+        START TRANSACTION statement to the MySQL server. You can optionally
+        set whether there should be a consistent snapshot, which
+        isolation level you need or which access mode i.e. READ ONLY or
+        READ WRITE.
+
+        Args:
+            consistent_snapshot: If `True`, Connector/Python sends WITH CONSISTENT
+                                 SNAPSHOT with the statement. MySQL ignores this for
+                                 isolation levels for which that option does not apply.
+            isolation_level: Permitted values are 'READ UNCOMMITTED', 'READ COMMITTED',
+                             'REPEATABLE READ', and 'SERIALIZABLE'. If the value is
+                             `None`, no isolation level is sent, so the default level
+                             applies.
+            readonly: Can be `True` to start the transaction in READ ONLY mode or
+                      `False` to start it in READ WRITE mode. If readonly is omitted,
+                      the server's default access mode is used.
+
+        Raises:
+            ProgrammingError: When a transaction is already in progress
+                              and when `ValueError` when `isolation_level`
+                              specifies an Unknown level.
+
+        Examples:
+            For example, to start a transaction with isolation level `SERIALIZABLE`,
+            you would do the following:
+            ```
+            >>> cnx = mysql.connector.aio.connect(...)
+            >>> await cnx.start_transaction(isolation_level='SERIALIZABLE')
+            ```
+        """
+        if self.in_transaction:
+            raise ProgrammingError("Transaction already in progress")
+
+        if isolation_level:
+            level = isolation_level.strip().replace("-", " ").upper()
+            levels = [
+                "READ UNCOMMITTED",
+                "READ COMMITTED",
+                "REPEATABLE READ",
+                "SERIALIZABLE",
+            ]
+
+            if level not in levels:
+                raise ValueError(f'Unknown isolation level "{isolation_level}"')
+
+            await self._execute_query(f"SET TRANSACTION ISOLATION LEVEL {level}")
+
+        if readonly is not None:
+            server_version = self.get_server_version()
+            if server_version < (5, 6, 5):
+                raise ValueError(
+                    f"MySQL server version {server_version} does not "
+                    "support this feature"
+                )
+
+            if readonly:
+                access_mode = "READ ONLY"
+            else:
+                access_mode = "READ WRITE"
+            await self._execute_query(f"SET TRANSACTION {access_mode}")
+
+        query = "START TRANSACTION"
+        if consistent_snapshot:
+            query += " WITH CONSISTENT SNAPSHOT"
+        await self.cmd_query(query)
+
+    async def reset_session(
+        self,
+        user_variables: Optional[Dict[str, Any]] = None,
+        session_variables: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Clears the current active session.
+
+        This method resets the session state, if the MySQL server is 5.7.3
+        or later active session will be reset without re-authenticating.
+        For other server versions session will be reset by re-authenticating.
+
+        It is possible to provide a sequence of variables and their values to
+        be set after clearing the session. This is possible for both user
+        defined variables and session variables.
+
+        Args:
+            user_variables: User variables map.
+            session_variables: System variables map.
+
+        Raises:
+            OperationalError: If not connected.
+            InternalError: If there are unread results and InterfaceError on errors.
+
+        Examples:
+            ```
+            >>> user_variables = {'var1': '1', 'var2': '10'}
+            >>> session_variables = {'wait_timeout': 100000, 'sql_mode': 'TRADITIONAL'}
+            >>> await cnx.reset_session(user_variables, session_variables)
+            ```
+        """
+        if not await self.is_connected():
+            raise OperationalError("MySQL Connection not available")
+
+        try:
+            await self.cmd_reset_connection()
+        except (NotSupportedError, NotImplementedError):
+            if self._compress:
+                raise NotSupportedError(
+                    "Reset session is not supported with compression for "
+                    "MySQL server version 5.7.2 or earlier"
+                ) from None
+            await self.cmd_change_user(
+                self._user,
+                self._password,
+                self._database,
+                self._charset_id,
+            )
+
+        if user_variables or session_variables:
+            cur = await self.cursor()
+            if user_variables:
+                for key, value in user_variables.items():
+                    await cur.execute(f"SET @`{key}` = {value}")
+            if session_variables:
+                for key, value in session_variables.items():
+                    await cur.execute(f"SET SESSION `{key}` = {value}")
+            await cur.close()
+
     @abstractmethod
     async def cmd_reset_connection(self) -> bool:
         """Resets the session state without re-authenticating.
@@ -1390,6 +1529,50 @@ class MySQLConnectionAbstract(ABC):
 
         This method will send the FETCH command to MySQL together with the given
         statement id and the number of rows to fetch.
+        """
+
+    @abstractmethod
+    async def cmd_change_user(
+        self,
+        username: str = "",
+        password: str = "",
+        database: str = "",
+        charset: int = 45,
+        password1: str = "",
+        password2: str = "",
+        password3: str = "",
+        oci_config_file: str = "",
+        oci_config_profile: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Changes the current logged in user.
+
+        It also causes the specified database to become the default (current)
+        database. It is also possible to change the character set using the
+        charset argument.
+
+        Args:
+            username: New account's username.
+            password: New account's password.
+            database: Database to become the default (current) database.
+            charset: Client charset (see [1]), only the lower 8-bits.
+            password1: New account's password factor 1 - it's used instead
+                       of `password` if set (higher precedence).
+            password2: New account's password factor 2.
+            password3: New account's password factor 3.
+            oci_config_file: OCI configuration file location (path-like string).
+            oci_config_profile: OCI configuration profile location (path-like string).
+
+        Returns:
+            ok_packet: Dictionary containing the OK packet information.
+
+        Examples:
+            ```
+            >>> await cnx.cmd_change_user(username='', password='', database='', charset=33)
+            ```
+
+        References:
+            [1]: https://dev.mysql.com/doc/dev/mysql-server/latest/\
+                page_protocol_basic_character_set.html#a_protocol_character_set
         """
 
     @abstractmethod
@@ -1550,7 +1733,7 @@ class MySQLCursorAbstract(ABC):
         """
         return self  # type: ignore[return-value]
 
-    async def __next__(self) -> RowType:
+    async def __anext__(self) -> RowType:
         """
         Used for iterating over the result set. Calles self.fetchone()
         to get the next row.

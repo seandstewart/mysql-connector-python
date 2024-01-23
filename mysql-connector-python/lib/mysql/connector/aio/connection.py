@@ -171,7 +171,7 @@ class MySQLConnection(MySQLConnectionAbstract):
             "_os": platform["version"],
         }
 
-        self._connection_attrs.update((default_conn_attrs))
+        self._connection_attrs.update(default_conn_attrs)
 
     async def _execute_query(self, query: str) -> ResultType:
         """Execute a query.
@@ -601,6 +601,53 @@ class MySQLConnection(MySQLConnectionAbstract):
             return False
         return True
 
+    async def reset_session(
+        self,
+        user_variables: Optional[Dict[str, Any]] = None,
+        session_variables: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Clears the current active session
+
+        This method resets the session state, if the MySQL server is 5.7.3
+        or later active session will be reset without re-authenticating.
+        For other server versions session will be reset by re-authenticating.
+
+        It is possible to provide a sequence of variables and their values to
+        be set after clearing the session. This is possible for both user
+        defined variables and session variables.
+        This method takes two arguments user_variables and session_variables
+        which are dictionaries.
+
+        Raises OperationalError if not connected, InternalError if there are
+        unread results and InterfaceError on errors.
+        """
+        if not await self.is_connected():
+            raise OperationalError("MySQL Connection not available.")
+
+        if not await self.cmd_reset_connection():
+            try:
+                await self.cmd_change_user(
+                    self._user,
+                    self._password,
+                    self._database,
+                    self._charset_id,
+                    self._password1,
+                    self._password2,
+                    self._password3,
+                    self._oci_config_file,
+                    self._oci_config_profile,
+                )
+            except ProgrammingError:
+                await self.reconnect()
+
+        cur = await self.cursor()
+        if user_variables:
+            for key, value in user_variables.items():
+                await cur.execute(f"SET @`{key}` = %s", (value,))
+        if session_variables:
+            for key, value in session_variables.items():
+                await cur.execute(f"SET SESSION `{key}` = %s", (value,))
+
     async def ping(
         self, reconnect: bool = False, attempts: int = 1, delay: int = 0
     ) -> None:
@@ -640,7 +687,7 @@ class MySQLConnection(MySQLConnectionAbstract):
 
         try:
             await self._socket.close_connection()
-        except Exception:  # pylint: disable=broad-exception-caught
+        except (OSError, socket.error):
             pass  # Getting an exception would mean we are disconnected.
 
     async def close(self) -> None:
@@ -1331,6 +1378,7 @@ class MySQLConnection(MySQLConnectionAbstract):
             await self.cmd_init_db(database)
 
         self._charset = charsets.get_by_id(charset)
+        self._charset_id = charset
         self._charset_name = self._charset.name
 
         # return ok_pkt
